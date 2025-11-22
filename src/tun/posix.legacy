@@ -1,0 +1,132 @@
+use crate::app_config::AppConfig;
+use crate::config::Config;
+use super::TUN;
+use anyhow::{anyhow, Result};
+use async_trait::async_trait;
+use log::{info, warn};
+use std::process::Command;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
+use tokio_tun::Tun;
+
+pub struct TUNDevice {
+    iface: Arc<Mutex<Tun>>,
+    name: String,
+    config: Arc<Config>,
+}
+
+#[async_trait]
+impl TUN for TUNDevice {
+    async fn create(
+        name: &str,
+        config: Arc<Config>,
+        _app_config: Arc<AppConfig>,
+    ) -> Result<Box<dyn TUN>> {
+        info!("Creating POSIX TUN device '{}'", name);
+        let tun = Tun::builder()
+            .name(name)
+            .tap(false)      // Ensure IP-level packets
+            .packet_info(false) // Don't prepend packet info
+            .up()            // Set interface up
+            .try_build()?;
+
+        // Set MTU
+        let mtu = config.interface.mtu;
+        info!("Setting MTU for '{}' to {}", name, mtu);
+        run_cmd(&format!("ip link set dev {} mtu {}", name, mtu))?;
+
+        // Set IP addresses
+        info!("Setting IP addresses for '{}'", name);
+        for addr in &config.interface.addresses {
+            run_cmd(&format!("ip addr add {} dev {}", addr, name))?;
+        }
+
+        // Set routes
+        info!("Configuring routes for '{}'", name);
+        for peer in &config.peers {
+            for cidr in peer.allowed_ips.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                if let Err(e) = run_cmd(&format!("ip route add {} dev {}", cidr, name)) {
+                    warn!("Failed to add route for {}: {}. This may be expected if the route already exists.", cidr, e);
+                }
+            }
+        }
+
+        // Run post-up command
+        if !config.interface.post_up.is_empty() {
+            let cmd_to_run = config.interface.post_up.replace("%i", name);
+            info!("Running PostUp command: {}", cmd_to_run);
+            if let Err(e) = run_cmd(&cmd_to_run) {
+                warn!("PostUp command failed: {}", e);
+            }
+        }
+
+        info!("TUN device '{}' is up and configured.", name);
+
+        Ok(Box::new(Self {
+            iface: Arc::new(Mutex::new(tun)),
+            name: name.to_string(),
+            config,
+        }))
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn write(&self, buf: &[u8]) -> Result<usize> {
+        let mut iface_guard = self.iface.lock().await;
+        Ok(iface_guard.write(buf).await?)
+    }
+
+    async fn read(&self) -> Result<Vec<u8>> {
+        let mut iface_guard = self.iface.lock().await;
+        // Use the configured MTU for a reasonable buffer size, with some headroom.
+        let mut buf = vec![0; (self.config.interface.mtu + 512) as usize];
+        let n = iface_guard.read(&mut buf).await?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
+    async fn try_clone(&self) -> Result<Box<dyn TUN>> {
+        Ok(Box::new(Self {
+            iface: self.iface.clone(),
+            name: self.name.clone(),
+            config: self.config.clone(),
+        }))
+    }
+}
+
+impl Drop for TUNDevice {
+    fn drop(&mut self) {
+        info!("Cleaning up TUN device '{}'", self.name);
+
+        // Run post-down command before tearing down the interface
+        if !self.config.interface.post_down.is_empty() {
+            let cmd_to_run = self.config.interface.post_down.replace("%i", &self.name);
+            info!("Running PostDown command: {}", cmd_to_run);
+            if let Err(e) = run_cmd(&cmd_to_run) {
+                warn!("PostDown command failed: {}", e);
+            }
+        }
+
+        // The interface is automatically brought down when the `Tun` object is dropped.
+        // Routes associated with it should also be cleaned up by the OS.
+    }
+}
+
+fn run_cmd(cmd: &str) -> Result<()> {
+    let args: Vec<&str> = cmd.split_whitespace().collect();
+    if args.is_empty() {
+        return Ok(());
+    }
+
+    let output = Command::new(args[0]).args(&args[1..]).output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("Command '{}' failed: {}", cmd, stderr));
+    }
+
+    Ok(())
+}

@@ -1,5 +1,7 @@
+#[cfg(target_os = "windows")]
 extern crate embed_resource;
-//#[cfg(target_os = "windows")]
+
+#[cfg(target_os = "windows")]
 fn main() {
     println!("cargo:rerun-if-changed=productinfo.rc");
     println!("cargo:rerun-if-changed=win_icon.ico"); // Or actual icon path

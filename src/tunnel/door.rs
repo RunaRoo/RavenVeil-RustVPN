@@ -1,91 +1,104 @@
 use super::*;
-use crate::crypto;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use log::{trace, warn};
+use log::{trace, warn, debug, error};
 use tokio::sync::mpsc;
 use std::sync::Arc;
+use bytes::Bytes;
+use sha2::{Sha256, Digest};
 
+/// Calculate a simple hash of the PSK to verify authorization without sending the raw key.
+pub(crate) fn hash_psk(psk: &str) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"RavenVeil-PSK-Auth:"); // Salt
+    hasher.update(psk.as_bytes());
+    hasher.finalize().to_vec()
+}
+
+/// Sends a raw IP packet via QUIC Datagrams.
 pub async fn send_packet(
-    destination_key: [u8; KEY_SIZE],
-    payload: bytes::Bytes,
+    destination_id: &str, // Changed from [u8;32] to String key
+    payload: Bytes,
     peers: &PeerMap,
 ) -> anyhow::Result<()> {
     let peers_guard = peers.read().await;
-    let peer = match peers_guard.get(&destination_key) {
+    let peer = match peers_guard.get(destination_id) {
         Some(p) => p.clone(),
         None => return Err(anyhow::anyhow!("Peer not found")),
     };
     drop(peers_guard);
 
     if !*peer.session_ready_rx.borrow() {
-        return Err(anyhow::anyhow!("Session not ready"));
+        return Ok(()); // Drop silently if not ready
     }
 
-    let mut noise = peer.noise.write().await;
-    let kp = noise.current_keypair.as_mut()
-        .ok_or_else(|| anyhow::anyhow!("No active keypair"))?;
-
-    let encrypted = crypto::encrypt_packet(&kp.send_key, kp.send_nonce, &payload)?;
-    kp.send_nonce += 1;
-    drop(noise);
-
-    peer.stats.bytes_sent.fetch_add(encrypted.len() as u64, std::sync::atomic::Ordering::Relaxed);
-
-    let mut stream_guard = peer.send_stream.lock().await;
-    if let Some(stream) = stream_guard.as_mut() {
-        if encrypted.len() > u16::MAX as usize {
-            return Err(anyhow::anyhow!("Packet too large"));
+    let conn_guard = peer.connection.read().await;
+    if let Some(conn) = conn_guard.as_ref() {
+        match conn.send_datagram(payload.clone()) {
+            Ok(_) => {
+                peer.stats.bytes_sent.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) => {
+                trace!("Datagram dropped: {}", e);
+                Ok(())
+            }
         }
-        let len = encrypted.len() as u16;
-
-        stream.write_u16(len).await?;
-        stream.write_all(&encrypted).await?;
     } else {
-        return Err(anyhow::anyhow!("Stream closed"));
+        Err(anyhow::anyhow!("Connection not established"))
     }
-
-    Ok(())
 }
 
+/// Reads incoming QUIC Datagrams.
+///
+/// This function also handles the initial "PSK Authorization" if a PSK is configured.
 pub async fn spawn_data_processor(
     peer: Arc<Peer>,
-    mut recv: quinn::RecvStream,
+    conn: quinn::Connection,
     tx: mpsc::Sender<TunnelEvent>,
 ) {
     tokio::spawn(async move {
-        loop {
-            let len = match recv.read_u16().await {
-                Ok(l) => l as usize,
-                Err(e) => {
-                    if e.kind() != std::io::ErrorKind::UnexpectedEof {
-                        warn!("Stream read error: {}", e);
-                    }
-                    break;
-                }
-            };
+        debug!("Datagram processor started for peer {}", peer.config.public_key);
 
-            let mut buf = vec![0u8; len];
-            if let Err(e) = recv.read_exact(&mut buf).await {
-                warn!("Stream failed to read payload of size {}: {}", len, e);
-                break;
+        // --- PSK CHECK LOGIC ---
+        // If a PSK is configured, we expect the FIRST datagram to be the PSK Hash.
+        if !peer.config.preshared_key.is_empty() {
+            debug!("Waiting for PSK verification...");
+            match conn.read_datagram().await {
+                Ok(data) => {
+                    let expected = hash_psk(&peer.config.preshared_key);
+                    if data != expected {
+                        error!("PSK Mismatch! Dropping connection.");
+                        conn.close(0u32.into(), b"PSK Auth Failed");
+                        return;
+                    }
+                    debug!("PSK Verified.");
+                }
+                Err(e) => {
+                    warn!("Failed to read PSK packet: {}", e);
+                    return;
+                }
             }
+        }
 
-            let mut noise = peer.noise.write().await;
-            match crypto::try_decrypt_with_rotation(&mut noise, &buf) {
-                Ok(plain) => {
-                    peer.stats.bytes_received.fetch_add(plain.len() as u64, std::sync::atomic::Ordering::Relaxed);
-
-                    if !plain.is_empty() {
-                        let _ = tx.send(TunnelEvent::DataReceived {
-                            source_key: peer.static_public_key,
-                            payload: plain.into()
-                        }).await;
-                    } else {
-                        trace!("Received KeepAlive");
+        // --- NORMAL TRAFFIC LOOP ---
+        loop {
+            match conn.read_datagram().await {
+                Ok(data) => {
+                    if data.is_empty() {
+                        trace!("Received Keepalive");
+                        continue;
                     }
+
+                    let packet_len = data.len();
+                    peer.stats.bytes_received.fetch_add(packet_len as u64, std::sync::atomic::Ordering::Relaxed);
+
+                    let _ = tx.send(TunnelEvent::DataReceived {
+                        source_id: peer.config.public_key.clone(),
+                        payload: data,
+                    }).await;
                 }
                 Err(e) => {
-                    warn!("Decryption failed from peer: {}", e);
+                    warn!("Connection lost: {}", e);
+                    break;
                 }
             }
         }

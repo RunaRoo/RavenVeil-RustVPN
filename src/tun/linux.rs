@@ -30,12 +30,17 @@ impl TUN for TUNDevice {
         _app_config: Arc<AppConfig>,
     ) -> Result<Box<dyn TUN>> {
         info!("Creating Linux TUN device '{}'", name);
+
+        // --- FIXED: Handle Vec<Tun> return type ---
+        // The .build() method returns a Vec<Tun> (for multi-queue support).
+        // We use .pop() to get the single interface instance we need.
         let tun = Tun::builder()
             .name(name)
-            .tap(false)
-            .packet_info(false)
             .up()
-            .try_build()?;
+            .build()
+            .map_err(|e| anyhow!("Failed to build TUN device: {}", e))?
+            .pop()
+            .ok_or(anyhow!("TUN builder returned no file descriptors"))?;
 
         let mtu = config.interface.mtu;
         run_cmd(&format!("ip link set dev {} mtu {}", name, mtu))?;
@@ -49,7 +54,7 @@ impl TUN for TUNDevice {
                 }
             }
         }
-        
+
         let mut dns_configured = false;
         if !config.interface.dns.is_empty() {
             info!("Configuring system DNS. This requires root privileges and may not work with systemd-resolved.");
@@ -60,7 +65,7 @@ impl TUN for TUNDevice {
                 dns_configured = true;
             }
         }
-        
+
         if !config.interface.post_up.is_empty() {
             let cmd = config.interface.post_up.replace("%i", name);
             info!("Running PostUp command: {}", &cmd);
@@ -133,7 +138,7 @@ fn configure_linux_dns(dns_servers: &str) -> Result<()> {
         fs::copy(RESOLV_CONF_PATH, RESOLV_CONF_BACKUP_PATH)
             .context("Failed to back up /etc/resolv.conf")?;
     }
-    
+
     let new_content: String = dns_servers
         .split(',')
         .map(|s| s.trim())
@@ -156,9 +161,12 @@ fn restore_linux_dns() -> Result<()> {
 }
 
 fn run_cmd(cmd: &str) -> Result<()> {
-    let args: Vec<&str> = cmd.split_whitespace().collect();
-    if args.is_empty() { return Ok(()); }
-    let output = Command::new(args[0]).args(&args[1..]).output()?;
+    // FIX: Use 'sh -c' to allow multiple commands separated by semicolons
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .output()?;
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!("Command '{}' failed: {}", cmd, stderr));

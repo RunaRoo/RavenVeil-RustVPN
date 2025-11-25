@@ -3,20 +3,22 @@ use crate::config::Config;
 use super::TUN;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use ipnetwork::IpNetwork;
 use log::{info, warn};
+use std::mem::ManuallyDrop;
 use std::process::Command;
-use std::str::FromStr;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
-use tokio_tun::Tun;
+use std::io::{Read, Write};
+use std::os::fd::FromRawFd;
+use std::os::unix::io::AsRawFd;
+use tokio::io::unix::AsyncFd;
+use tun::Device;
 
 pub struct TUNDevice {
-    iface: Arc<Mutex<Tun>>,
+    iface: Arc<Mutex<AsyncFd<tun::platform::Device>>>,
     name: String,
     config: Arc<Config>,
-    dns_configured_service: Option<String>,
+    dns_service: Option<String>,
 }
 
 #[async_trait]
@@ -27,63 +29,74 @@ impl TUN for TUNDevice {
         _app_config: Arc<AppConfig>,
     ) -> Result<Box<dyn TUN>> {
         info!("Creating macOS TUN device '{}'", name);
-        let tun = Tun::builder()
+
+        let mut tun_config = tun::Configuration::default();
+        tun_config
+            .layer(tun::Layer::L3)
             .name(name)
-            .tap(false)
-            .packet_info(false)
-            .up()
-            .try_build()?;
-        
-        let actual_name = tun.name();
-        info!("TUN device created with actual name: {}", actual_name);
+            .up();
 
-        let mtu = config.interface.mtu;
-        run_cmd(&format!("ifconfig {} mtu {}", actual_name, mtu))?;
+        let device = tun::create(&tun_config)
+            .map_err(|e| anyhow!("Failed to create TUN device: {}", e))?;
 
-        for addr_str in &config.interface.addresses {
-            let network = IpNetwork::from_str(addr_str)?;
-            let ip = network.ip();
-            let dest_ip = ip; 
-            run_cmd(&format!("ifconfig {} {} {}", actual_name, ip, dest_ip))?;
+        // Set non-blocking mode using socket2 to avoid unsafe libc calls
+        let raw_fd = device.as_raw_fd();
+        let socket = unsafe { socket2::Socket::from_raw_fd(raw_fd) };
+        socket.set_nonblocking(true)?;
+        // IMPORTANT: We must forget the socket, otherwise it closes the FD when dropped!
+        std::mem::forget(socket);
+
+        let async_device = AsyncFd::new(device)?;
+
+        // Handle the Result returned by name()
+        let actual_name = async_device.get_ref().name()
+            .map_err(|e| anyhow!("Failed to get TUN name: {}", e))?;
+
+        info!("TUN device created: {}", actual_name);
+
+        // Set MTU
+        run_cmd(&format!("ifconfig {} mtu {}", actual_name, config.interface.mtu))?;
+
+        // Assign IP addresses
+        for addr in &config.interface.addresses {
+            run_cmd(&format!("ifconfig {} {} {} up", actual_name, addr, addr))?;
         }
 
+        // Add routes
         for peer in &config.peers {
-             for cidr in peer.allowed_ips.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            for cidr in peer.allowed_ips.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
                 if let Err(e) = run_cmd(&format!("route add -net {} -interface {}", cidr, actual_name)) {
-                    warn!("Failed to add route for {}: {}", cidr, e);
+                    warn!("Failed to add route {}: {}", cidr, e);
                 }
             }
         }
-        
-        let mut dns_configured_service = None;
+
+        // DNS configuration
+        let mut dns_service = None;
         if !config.interface.dns.is_empty() {
-            info!("Configuring system DNS for macOS...");
-            match configure_macos_dns(&config.interface.dns) {
-                Ok(service_name) => {
-                    info!("System DNS configured on service '{}' to use: {}", &service_name, &config.interface.dns);
-                    dns_configured_service = Some(service_name);
+            match configure_dns(&config.interface.dns) {
+                Ok(service) => {
+                    info!("DNS configured on service: {}", service);
+                    dns_service = Some(service);
                 }
-                Err(e) => {
-                    warn!("Failed to configure system DNS: {}. DNS queries may leak.", e);
-                }
+                Err(e) => warn!("Failed to set DNS: {}", e),
             }
         }
 
+        // PostUp script
         if !config.interface.post_up.is_empty() {
-            let cmd = config.interface.post_up.replace("%i", actual_name);
-            info!("Running PostUp command: {}", &cmd);
-            if let Err(e) = run_cmd(&cmd) {
-                warn!("PostUp command failed: {}", e);
-            }
+            let cmd = config.interface.post_up.replace("%i", &actual_name);
+            info!("Running PostUp: {}", cmd);
+            let _ = run_cmd(&cmd);
         }
 
-        info!("TUN device '{}' is up and configured.", actual_name);
+        info!("macOS TUN interface '{}' is ready", actual_name);
 
         Ok(Box::new(Self {
-            iface: Arc::new(Mutex::new(tun)),
-            name: actual_name.to_string(),
+            iface: Arc::new(Mutex::new(async_device)),
+            name: actual_name,
             config,
-            dns_configured_service,
+            dns_service,
         }))
     }
 
@@ -92,34 +105,56 @@ impl TUN for TUNDevice {
     }
 
     async fn write(&self, buf: &[u8]) -> Result<usize> {
-        let mut fixed_buf = Vec::with_capacity(buf.len() + 4);
-        if buf.get(0).map_or(false, |&b| (b >> 4) == 4) {
-            fixed_buf.extend_from_slice(&[0, 0, 0, 2]); // AF_INET
-        } else if buf.get(0).map_or(false, |&b| (b >> 4) == 6) {
-            fixed_buf.extend_from_slice(&[0, 0, 0, 30]); // AF_INET6
-        } else {
-            fixed_buf.extend_from_slice(&[0, 0, 0, 2]);
+        let mut guard = self.iface.lock().await;
+        // Capture the raw FD so we can use it inside the closure without borrowing guard
+        let fd = guard.as_raw_fd();
+
+        loop {
+            let mut ready_guard = guard.writable().await?;
+
+            // Use try_io with socket2 to write to the FD.
+            // socket2 implementations of Read/Write work on '&Socket' (immutable),
+            // which solves the borrowing conflict.
+            match ready_guard.try_io(|_inner| {
+                let socket = unsafe { socket2::Socket::from_raw_fd(fd) };
+                let socket = ManuallyDrop::new(socket);
+                (&*socket).write(buf)
+            }) {
+                Ok(result) => return result.map_err(|e| anyhow!(e)),
+                Err(_would_block) => continue, // try_io handles clearing readiness
+            }
         }
-        fixed_buf.extend_from_slice(buf);
-        self.iface.lock().await.write(&fixed_buf).await.map_err(Into::into)
     }
 
     async fn read(&self) -> Result<Vec<u8>> {
-        let mut buf = vec![0; (self.config.interface.mtu + 512) as usize];
-        let n = self.iface.lock().await.read(&mut buf).await?;
-        if n > 4 {
-            Ok(buf[4..n].to_vec())
-        } else {
-            Ok(Vec::new())
+        let mut buf = vec![0u8; self.config.interface.mtu as usize + 512];
+        let mut guard = self.iface.lock().await;
+        let fd = guard.as_raw_fd();
+
+        loop {
+            let mut ready_guard = guard.readable().await?;
+
+            match ready_guard.try_io(|_inner| {
+                let socket = unsafe { socket2::Socket::from_raw_fd(fd) };
+                let socket = ManuallyDrop::new(socket);
+                (&*socket).read(&mut buf)
+            }) {
+                Ok(result) => {
+                    let n = result.map_err(|e| anyhow!(e))?;
+                    buf.truncate(n);
+                    return Ok(buf);
+                },
+                Err(_would_block) => continue,
+            }
         }
     }
-    
-     async fn try_clone(&self) -> Result<Box<dyn TUN>> {
-        Ok(Box::new(TUNDevice {
+
+    async fn try_clone(&self) -> Result<Box<dyn TUN>> {
+        Ok(Box::new(Self {
             iface: self.iface.clone(),
             name: self.name.clone(),
             config: self.config.clone(),
-            dns_configured_service: self.dns_configured_service.clone(),
+            dns_service: self.dns_service.clone(),
         }))
     }
 }
@@ -128,63 +163,58 @@ impl Drop for TUNDevice {
     fn drop(&mut self) {
         info!("Cleaning up TUN device '{}'", self.name);
 
-        if let Some(service) = &self.dns_configured_service {
-            if let Err(e) = restore_macos_dns(service) {
-                warn!("Failed to restore original DNS settings for service '{}': {}", service, e);
-            } else {
-                info!("Original DNS settings restored for service '{}'.", service);
-            }
+        if let Some(service) = &self.dns_service {
+            let _ = restore_dns(service);
         }
-        
+
         if !self.config.interface.post_down.is_empty() {
             let cmd = self.config.interface.post_down.replace("%i", &self.name);
-            info!("Running PostDown command: {}", &cmd);
-            if let Err(e) = run_cmd(&cmd) {
-                warn!("PostDown command failed: {}", e);
-            }
+            let _ = run_cmd(&cmd);
         }
     }
 }
 
-fn get_primary_network_service() -> Result<String> {
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg("networksetup -listallnetworkservices | tail -n +2")
+// --- Helper Functions ---
+
+fn get_primary_service() -> Result<String> {
+    let output = Command::new("networksetup")
+        .arg("-listnetworkserviceorder")
         .output()?;
-    let services = String::from_utf8_lossy(&output.stdout);
-    for service in services.lines() {
-        if service.to_lowercase().contains("wan") || service.to_lowercase().contains("wi-fi") || service.to_lowercase().contains("ethernet") {
-             if let Ok(output) = Command::new("networksetup").arg("-getinfo").arg(service).output() {
-                let info_str = String::from_utf8_lossy(&output.stdout);
-                if info_str.contains("IP address:") && !info_str.contains("IP address: none") {
+    let output = String::from_utf8_lossy(&output.stdout);
+
+    for line in output.lines() {
+        if line.contains("(Hardware Port:") {
+            if let Some(service) = line.split(':').nth(1).map(|s| s.trim().trim_matches('"')) {
+                if service.contains("Wi-Fi") || service.contains("Ethernet") || service.contains("Thunderbolt") {
                     return Ok(service.to_string());
                 }
             }
         }
     }
-    Err(anyhow!("Could not determine primary network service"))
+    Err(anyhow!("No active network service found"))
 }
 
-fn configure_macos_dns(dns_servers: &str) -> Result<String> {
-    let service = get_primary_network_service()?;
-    let servers_str = dns_servers.replace(',', " ");
-    let cmd = format!("networksetup -setdnsservers \"{}\" {}", service, servers_str);
-    run_cmd(&cmd)?;
+fn configure_dns(dns_servers: &str) -> Result<String> {
+    let service = get_primary_service()?;
+    let servers = dns_servers.replace(',', " ");
+    run_cmd(&format!("networksetup -setdnsservers \"{}\" {}", service, servers))?;
     Ok(service)
 }
 
-fn restore_macos_dns(service_name: &str) -> Result<()> {
-    let cmd = format!("networksetup -setdnsservers \"{}\" empty", service_name);
-    run_cmd(&cmd)
+fn restore_dns(service: &str) -> Result<()> {
+    run_cmd(&format!("networksetup -setdnsservers \"{}\" empty", service))
+        .map_err(|e| {
+            warn!("Failed to restore DNS: {}", e);
+            e
+        })
 }
 
 fn run_cmd(cmd: &str) -> Result<()> {
-    let args: Vec<&str> = cmd.split_whitespace().collect();
-    if args.is_empty() { return Ok(()); }
-    let output = Command::new(args[0]).args(&args[1..]).output()?;
+    info!("Running: {}", cmd);
+    let output = Command::new("sh").arg("-c").arg(cmd).output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("Command '{}' failed: {}", cmd, stderr));
+        return Err(anyhow!("Command failed: {}\n{}", cmd, stderr));
     }
     Ok(())
 }

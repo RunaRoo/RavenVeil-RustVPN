@@ -5,7 +5,7 @@ use log::{error, info, LevelFilter};
 mod app_config;
 mod certs;
 mod config;
-mod crypto;
+// mod crypto; // REMOVED: Replaced by TLS 1.3
 mod logger;
 mod tun;
 mod tunnel;
@@ -39,13 +39,6 @@ enum Commands {
         #[clap(value_parser)]
         config_file: String,
     },
-    /// Generates a new X25519 keypair.
-    Genkey,
-    /// Generates a new pre-shared key.
-    Genpsk,
-    /// Generates a new Kyber-1024 post-quantum keypair.
-    #[cfg(feature = "pqc_kyber")]
-    Genkyber,
     /// Generates a sample config.toml file.
     GenConfig,
     /// Generates TLS certificates for QUIC transport.
@@ -68,7 +61,10 @@ enum CertCommands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    // --- CRITICAL: Install AWS-LC Crypto Provider ---
+    // This enables support for Post-Quantum algorithms (X25519Kyber768Draft00)
+    // and standard TLS 1.3 ciphers via the aws-lc-rs crate.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     if std::env::args().len() > 1 && std::env::args().nth(1) != Some("up".to_string()) {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -81,24 +77,6 @@ async fn main() -> Result<()> {
         Commands::Up { config_file } => {
             let app_config = Arc::new(AppConfig::load(APP_CONFIG_PATH).await?);
             run_vpn(config_file, app_config).await?;
-        }
-        Commands::Genkey => {
-            let (priv_key, pub_key) = crypto::generate_keys_cli()?;
-            println!("--- X25519 Keys ---");
-            println!("PrivateKey = \"{}\"", priv_key);
-            println!("PublicKey  = \"{}\"", pub_key);
-        }
-        Commands::Genpsk => {
-            let psk = crypto::generate_preshared_key()?;
-            println!("--- Pre-Shared Key ---");
-            println!("PresharedKey = \"{}\"", psk);
-        }
-        #[cfg(feature = "pqc_kyber")]
-        Commands::Genkyber => {
-            let (priv_key, pub_key) = crypto::generate_kyber_keys()?;
-            println!("--- Kyber1024 Keys (Post-Quantum) ---");
-            println!("KyberPrivateKey = \"{}\"", priv_key);
-            println!("PublicKey  = \"{}\"", pub_key);
         }
         Commands::GenConfig => {
             fs::write("config.toml", SAMPLE_CONFIG)?;
@@ -139,7 +117,7 @@ async fn run_vpn(config_path: &str, app_config: Arc<AppConfig>) -> Result<()> {
     let log_path = if app_config.log.log_path.is_empty() { None } else { Some(app_config.log.log_path.as_str()) };
     StructuredLogger::init(log_level, log_path, log_to_std)?;
 
-    info!("Starting RavenVeil VPN...");
+    info!("Starting RavenVeil VPN (Pure QUIC/TLS Mode)...");
     let config = Arc::new(Config::load(config_path).await.context("Failed to load VPN config")?);
 
     // --- Start Tunnel Core (Waveguider) ---
@@ -176,7 +154,7 @@ async fn run_vpn(config_path: &str, app_config: Arc<AppConfig>) -> Result<()> {
     });
 
     // --- Mode Selection ---
-    let task_handle = if app_config.enable_tun {
+    let _task_handle = if app_config.enable_tun {
         info!("Starting in TUN mode...");
         if config.interface.addresses.is_empty() {
             return Err(anyhow::anyhow!("TUN mode requires at least one address in config.toml"));
@@ -184,8 +162,10 @@ async fn run_vpn(config_path: &str, app_config: Arc<AppConfig>) -> Result<()> {
         let tun = tun::TUNDevice::create(DEFAULT_INTERFACE_NAME, config.clone(), app_config.clone()).await?;
         let tun_reader = Arc::new(tun);
         let tun_writer = tun_reader.try_clone().await?;
+
+        // Build Routing Table (Keys are Strings)
         let routing_table = crate::config::build_routing_table(&config.peers)?;
-        let routing_table = Arc::new(tokio::sync::RwLock::new(routing_table)); // Wrap in lock here to match old sig
+        let routing_table = Arc::new(tokio::sync::RwLock::new(routing_table));
 
         // Spawn the tun loop
         tokio::spawn(async move {
@@ -223,7 +203,8 @@ async fn run_tun_loop(
     tun_writer: Box<dyn TUN>,
     to_tunnel_tx: mpsc::Sender<TunnelCommand>,
     from_tunnel_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<TunnelEvent>>>,
-    routing_table: Arc<tokio::sync::RwLock<Vec<(ipnetwork::IpNetwork, [u8; 32])>>>,
+    // FIX: Routing table uses String keys now
+    routing_table: Arc<tokio::sync::RwLock<Vec<(ipnetwork::IpNetwork, String)>>>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> Result<()> {
     let mut from_tunnel_rx_guard = from_tunnel_rx.lock().await;
@@ -233,12 +214,13 @@ async fn run_tun_loop(
             tun_result = tun_reader.read() => {
                 match tun_result {
                     Ok(packet) if !packet.is_empty() => {
-                         // Note: routing table lookup moved to tunnel for better architecture,
-                         // but strictly speaking the old main.rs logic did lookup here.
-                         // We keep it here for now to match the `find_route_for_packet` usage
-                         // or we can move it. For safety, let's use the helper from tunnel mod.
-                        if let Some(dest_key) = tunnel::find_route_for_packet(&packet, &routing_table).await {
-                            let cmd = TunnelCommand::SendData { destination_key: dest_key, payload: packet.into() };
+                         // Find destination based on IP
+                        if let Some(dest_id) = crate::tunnel::find_route_for_packet(&packet, &routing_table).await {
+                            // Send to Tunnel (Datagram) using destination_id
+                            let cmd = TunnelCommand::SendData {
+                                destination_id: dest_id,
+                                payload: packet.into()
+                            };
                             if to_tunnel_tx.send(cmd).await.is_err() { break; }
                         }
                     }
@@ -249,6 +231,7 @@ async fn run_tun_loop(
             event = from_tunnel_rx_guard.recv() => {
                 match event {
                     Some(TunnelEvent::DataReceived { payload, .. }) => {
+                        // Write to TUN interface
                         if let Err(e) = tun_writer.write(&payload).await {
                             error!("TUN write error: {}", e);
                         }
